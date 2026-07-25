@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Nazar by Privacy Labs</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo"><span>🧿 <b>Nazar</b><sup class="beta-tag">beta</sup></span><span class="byline">by <img class="pl-wordmark" src="../assets/brand/logo-side.svg" alt="Privacy Labs"></span></div>
+      <div class="site" id="siteName">-</div>
+    </header>
+
+    <section class="grade-section" id="gradeSection">
+      <div class="grade-circle" id="gradeCircle">…</div>
+      <div class="grade-meta">
+        <div class="grade-title" id="gradeTitle">Analyzing privacy policy…</div>
+        <div class="grade-sub" id="gradeSub"></div>
+      </div>
+    </section>
+
+    <section class="verdict" id="verdict" hidden></section>
+
+    <section class="findings" id="findings"></section>
+
+    <section class="row" id="bannerRow">
+      <span class="row-label">Cookie banner</span>
+      <span class="row-value" id="bannerStatus">-</span>
+    </section>
+
+    <section class="row trackers-row">
+      <span class="row-label">Trackers blocked here</span>
+      <span class="row-value" id="trackerCount">-</span>
+    </section>
+    <div class="tracker-list" id="trackerList"></div>
+
+    <section class="row" id="detectedRow" hidden>
+      <span class="row-label">Also present (not blocked)</span>
+      <span class="row-value" id="detectedCount">-</span>
+    </section>
+    <div class="tracker-list" id="detectedList"></div>
+
+    <section class="row">
+      <span class="row-label">Cookies stored by this site</span>
+      <span class="row-value" id="cookieCount">-</span>
+    </section>
+    <button class="link-btn" id="clearCookiesBtn" hidden>Clear cookies</button>
+
+    <section class="row">
+      <span class="row-label">Do-not-sell signal (GPC)</span>
+      <span class="row-value good">Sent ✓</span>
+    </section>
+
+    <section class="alternatives" id="alternatives" hidden>
+      <div class="alt-title">Privacy-friendly alternatives</div>
+      <div id="altList"></div>
+    </section>
+
+    <div class="toggle-row">
+      <label for="toastToggle">Show alert on risky sites</label>
+      <input type="checkbox" id="toastToggle" checked>
+    </div>
+
+    <div class="toggle-row">
+      <label for="aiToggle">AI-powered analysis</label>
+      <input type="checkbox" id="aiToggle" checked>
+    </div>
+
+    <div class="toggle-row">
+      <label for="siteAllowToggle" title="Turn blocking off if this site misbehaves (chat widget missing, etc.)">Pause blocking on this site</label>
+      <input type="checkbox" id="siteAllowToggle">
+    </div>
+
+    <button class="refresh-btn" id="refreshBtn">Re-analyze policy</button>
+
+    <footer>
+      <span id="totalBanners">0 banners blocked so far</span>
+      <a href="https://theprivacylabs.com" target="_blank" title="theprivacylabs.com"><img class="pl-wordmark-footer" src="../assets/brand/logo-side.svg" alt="Privacy Labs"></a>
+    </footer>
+  </div>
+  <script src="alternatives.js"></script>
+  <script src="tracker-rules.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+# Secrets, never commit
+.env
+.env.*
+!.env.example
+
+# Local + build artifacts
+node_modules/
+*.zip
+archive-buildinpublic/
+
+# Unrelated project files that sometimes land in this working directory
+# (e.g. a marketing/launch video project) — never part of the extension.
+video/
+
+# Local AI assistant tooling config — not part of the extension.
+.claude/
+
+# Chrome-generated when loading declarativeNetRequest rulesets
+_metadata/
+
+# OS noise
+.DS_Store
+Thumbs.db

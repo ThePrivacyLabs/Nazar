@@ -1,0 +1,74 @@
+/* Nazar: hide known consent banners before they paint.
+   Only vendor-specific CMP containers are listed here; generic selectors
+   are handled in JS with stricter checks to avoid hiding real content. */
+
+/* OneTrust */
+#onetrust-banner-sdk,
+#onetrust-consent-sdk,
+/* Cookiebot */
+#CybotCookiebotDialog,
+#CybotCookiebotDialogBodyUnderlay,
+#cookiebanner[data-cb-version],
+/* Quantcast */
+.qc-cmp2-container,
+#qc-cmp2-container,
+/* Didomi */
+#didomi-host,
+#didomi-popup,
+/* CookieYes */
+.cky-consent-container,
+.cky-overlay,
+/* Complianz */
+#cmplz-cookiebanner-container,
+/* Osano */
+.osano-cm-window,
+.osano-cm-dialog--type_bar,
+/* TrustArc (iframe-based, click-through not possible, hide) */
+#truste-consent-track,
+.truste_box_overlay,
+.truste_overlay,
+/* Usercentrics (shadow DOM inside; hiding host is enough) */
+#usercentrics-root,
+#usercentrics-cmp-ui,
+/* Google Funding Choices */
+.fc-consent-root,
+/* Sourcepoint (iframe-based) */
+div[id^="sp_message_container"],
+/* Cookie Information */
+#coiOverlay,
+/* Termly */
+#termly-code-snippet-support,
+/* Iubenda */
+#iubenda-cs-banner,
+/* CookieFirst */
+.cookiefirst-root,
+/* Borlabs */
+#BorlabsCookieBox,
+#BorlabsCookieWidget,
+/* Klaro */
+#klaro,
+.klaro .cookie-notice,
+/* Cookie Consent (Insites) */
+.cc-window.cc-banner,
+.cc-window.cc-floating,
+/* Moove GDPR (WordPress) */
+#moove_gdpr_cookie_info_bar,
+/* CookiePro */
+#cookie-law-info-bar,
+#cookie-law-info-again,
+/* Secure Privacy */
+#spBannerWrapper,
+/* consentmanager.net */
+#cmpbox, #cmpbox2 {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* Funding Choices adds this to lock scrolling */
+.fc-ab-root ~ body,
+html.fc-consent-scroll-lock,
+body.fc-consent-scroll-lock {
+  overflow: auto !important;
+}
