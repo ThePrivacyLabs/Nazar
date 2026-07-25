@@ -105,6 +105,8 @@ repo. The request/response contract is documented in
 
 ## Privacy
 
+Full policy: [theprivacylabs.com/legal/nazar-privacy](https://theprivacylabs.com/legal/nazar-privacy)
+
 **Nazar analyzes _websites_, never _you_.** There is no user-level tracking of
 any kind: no analytics, no accounts, no device or user ID, no browsing-history
 collection, no cross-site profile, nothing that identifies who you are.

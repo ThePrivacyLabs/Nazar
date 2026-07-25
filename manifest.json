@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Nazar by Privacy Labs",
-  "version": "0.2.0",
-  "description": "Wards off buri nazar on your browsing: auto-rejects non-essential cookies and grades every website's privacy policy so you know who to trust.",
+  "name": "Nazar - Privacy, Cookie & Tracker Blocker",
+  "version": "0.3.0",
+  "description": "Blocks trackers, auto-rejects cookie popups, sends privacy signals, and grades privacy policies, built for India's DPDP Act.",
   "permissions": ["storage", "activeTab", "cookies", "declarativeNetRequest", "declarativeNetRequestFeedback"],
   "host_permissions": ["<all_urls>"],
   "declarative_net_request": {
