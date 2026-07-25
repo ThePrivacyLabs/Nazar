@@ -15,6 +15,9 @@ video/
 # Local AI assistant tooling config — not part of the extension.
 .claude/
 
+# Internal store-submission notes — not for public distribution.
+PUBLISHING.md
+
 # Chrome-generated when loading declarativeNetRequest rulesets
 _metadata/
 
