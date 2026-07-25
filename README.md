@@ -1,4 +1,4 @@
-# 🧿 Nazar — privacy guardian for your browser
+# 🧿 Nazar - privacy guardian for your browser
 
 ![status: beta](https://img.shields.io/badge/status-beta-orange) ![license: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)
 
