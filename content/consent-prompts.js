@@ -218,6 +218,10 @@
     return { gave: purposesIn(giving && giving[2]), refused: purposesIn(refusing && refusing[2]) };
   }
 
+  // A required purpose's name without its "Required" badge, which sits
+  // inside the same label on many prompts.
+  const withoutRequiredTag = (name) => name.replace(/\s*[(\[]?\s*(required|mandatory)\s*[)\]]?\s*\*?$/i, '') || name;
+
   function decide(plan, label, root) {
     if (plan.type === 'itemised') {
       const n = plan.toggles.length;
@@ -227,7 +231,7 @@
         toggles: plan.toggles,
         decision: DECISION.REQUIRED_ONLY,
         reason: 'Kept only what is required',
-        gave: locked.map(dom.nameOf),
+        gave: locked.map((el) => withoutRequiredTag(dom.nameOf(el))),
         refused: plan.toggles.map(dom.nameOf),
         line: n > 0
           ? `Switched off ${n} optional purpose${n === 1 ? '' : 's'} and kept the required ones: "${label}"`
