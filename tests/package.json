@@ -1,0 +1,13 @@
+{
+  "name": "nazar-tests",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests for the Nazar extension. Not part of the extension itself.",
+  "scripts": {
+    "test": "node run.mjs",
+    "test:unit": "node --test unit/notice-checks.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.61.1"
+  }
+}

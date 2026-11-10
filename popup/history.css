@@ -1,0 +1,23 @@
+/* Nazar, history page. Builds on popup.css; only the page-width layout differs. */
+
+body.history { width: auto; }
+.history .container { max-width: 640px; margin: 0 auto; padding: 32px 20px; }
+.history header { align-items: center; }
+.history h1 { font-size: 22px; font-weight: 900; margin: 8px 0 4px; }
+.history .lede { color: var(--muted); margin-bottom: 20px; }
+.history .day-title {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin: 18px 0 6px;
+}
+.history .site-title {
+  display: block;
+  font-weight: 800;
+  color: var(--ink);
+  text-decoration: none;
+  margin-bottom: 4px;
+}
+.history .site-title:hover { color: var(--blue); text-decoration: underline; }

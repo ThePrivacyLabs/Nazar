@@ -4,26 +4,33 @@
 // 3. Unlocks page scroll after a banner is removed
 // 4. Detects known trackers loaded by the page
 // 5. Finds the site's privacy policy link and reports to the background worker
+//
+// Shared helpers (dom, vocab, ext, activity, toast) live in content/lib/.
 
 (() => {
   if (window.top !== window) return; // top frame only
+
+  const { dom, vocab, ext, activity, toast } = globalThis.Nazar;
+  const { textOf, isVisible, isUnsafeHref, leavesPage, parentThroughShadow } = dom;
+  const extAlive = ext.alive;
 
   const HOST = location.hostname;
   let bannerHandled = false;
   let rejectClicked = false;
 
-  // After the extension reloads or auto-updates, a content script from the
-  // old version keeps running in already-open tabs, but its chrome.* calls
-  // throw "Extension context invalidated". Guard every chrome API use with
-  // this so those calls fail silently instead of spamming uncaught errors.
-  function extAlive() {
-    try { return !!(chrome.runtime && chrome.runtime.id); } catch { return false; }
-  }
-  function notifyBlocked() {
-    if (!extAlive()) return;
-    try {
-      chrome.runtime.sendMessage({ action: 'bannerBlocked', host: HOST }).catch(() => {});
-    } catch { /* context gone */ }
+  // The single place a banner becomes "handled": whichever path rejected it
+  // (CMP selector, generic, toggles, AI recipe), the follow-up is the same.
+  function markBannerHandled() {
+    if (bannerHandled) return;
+    rejectClicked = true;
+    bannerHandled = true;
+    unlockScroll();
+    activity.record({
+      kind: activity.KIND.COOKIE,
+      decision: activity.DECISION.DECLINED,
+      label: 'Cookie banner',
+      reason: 'Non-essential cookies',
+    });
   }
 
   // ---------------------------------------------------------------
@@ -63,28 +70,9 @@
     return false;
   }
 
-  // Many modern CMPs (Usercentrics, GoTrust as used by Lenskart, others)
-  // render inside open shadow roots, which document.querySelectorAll cannot
-  // see into. Collect every open shadow root so all detection, CMP
-  // selectors, generic reject, and AI candidates, works through them.
-  function getSearchRoots() {
-    const roots = [document];
-    try {
-      for (const el of document.querySelectorAll('*')) {
-        if (el.shadowRoot) roots.push(el.shadowRoot);
-        if (roots.length > 20) break;
-      }
-    } catch { /* ignore */ }
-    return roots;
-  }
-
-  // Walk upward through shadow boundaries: when a chain tops out inside a
-  // shadow root, continue from the root's host element in the outer DOM.
-  function parentThroughShadow(node) {
-    if (node.parentElement) return node.parentElement;
-    const root = node.getRootNode && node.getRootNode();
-    return root && root.host ? root.host : null;
-  }
+  // Every open shadow root too, so CMP selectors, generic reject and AI
+  // candidates all work through shadow-DOM banners (Usercentrics, GoTrust).
+  const getSearchRoots = dom.searchRoots;
 
   // PrivacyLabs DPDP banner has no one-click reject; rejecting means
   // opening Customize (toggles default off) and saving preferences.
@@ -107,27 +95,8 @@
   // ---------------------------------------------------------------
   // 2. Generic reject-button detection
   // ---------------------------------------------------------------
-  const REJECT_TEXT = new RegExp(
-    '^(' +
-    [
-      'reject( all| non.essential| unnecessary| optional)?( cookies)?',
-      'decline( all| non.essential| unnecessary| optional)?( cookies)?',
-      'refuse( all| non.essential| unnecessary| optional)?( cookies)?',
-      'deny( all)?',
-      'disagree',
-      'i (do not|don.t) accept',
-      'only (strictly )?(necessary|essential)( cookies)?',
-      '(strictly )?(necessary|essential)( cookies)? only',
-      'use necessary cookies only',
-      'continue without (agreeing|accepting)',
-      'no,? thanks?',
-      'अस्वीकार करें', // Hindi: reject
-    ].join('|') +
-    ')$',
-    'i'
-  );
-
-  const BANNER_HINT = /cookie|consent|gdpr|dpdp|cmp|privacy|banner|notice|policy/i;
+  const REJECT_TEXT = vocab.DECLINE;
+  const BANNER_HINT = vocab.BANNER_HINT;
 
   // A real consent banner is anchored to the viewport (fixed/sticky) AND
   // carries a cookie/consent hint in its id/class chain. Requiring both avoids
@@ -185,7 +154,7 @@
   // those appear all over normal app UIs (e.g. Google Ads) and caused false
   // clicks. Only cookie/consent-qualified phrases, or unambiguous CMP
   // wording, count as a customize control.
-  const CUSTOMIZE_TEXT = /^(customi[sz]e( cookies?( settings| preferences| choices)?| choices| settings| preferences)?|manage cookies|manage (cookie )?(preferences|options|choices)|cookie (preferences|settings|choices)|allow selection)$/i;
+  const CUSTOMIZE_TEXT = vocab.CUSTOMIZE;
   let customizeAttempted = false;
 
   function tryCustomizeFlow() {
@@ -195,15 +164,16 @@
       candidates.push(...root.querySelectorAll('button, a, [role="button"]'));
     }
     for (const el of candidates) {
-      if (el.getClientRects().length === 0) continue;
-      const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+      if (!isVisible(el)) continue;
+      const text = textOf(el);
       if (!CUSTOMIZE_TEXT.test(text)) continue;
+      if (isUnsafeHref(el)) continue;
       const container = looksLikeBannerContainer(el) || nearbyCookieText(el);
       if (!container) continue;
       // Skip if this same container already has a direct reject button;
       // genericReject() would have already clicked it.
       const hasDirectReject = [...container.querySelectorAll('button, a, [role="button"]')].some((b) => {
-        const t = (b.innerText || b.textContent || '').trim().replace(/\s+/g, ' ');
+        const t = textOf(b);
         return REJECT_TEXT.test(t);
       });
       if (hasDirectReject) continue;
@@ -220,7 +190,7 @@
   // customize flow above), switch every consent toggle OFF, then save.
   // Gated on customizeAttempted so we only ever touch toggles after having
   // clicked a customize button inside a verified cookie banner.
-  const SAVE_TEXT = /^((save|confirm)( my)?( choices| preferences| selection| settings)?|save my choices)$/i;
+  const SAVE_TEXT = vocab.SAVE;
   let toggleSaveAttempted = false;
 
   function tryToggleSave() {
@@ -229,7 +199,7 @@
     const toggles = [];
     for (const root of roots) {
       for (const el of root.querySelectorAll('[role="switch"][aria-checked="true"], input[type="checkbox"]:checked:not(:disabled)')) {
-        if (el.getClientRects().length === 0) continue;
+        if (!isVisible(el)) continue;
         if (!(looksLikeBannerContainer(el) || nearbyCookieText(el))) continue;
         toggles.push(el);
       }
@@ -241,17 +211,13 @@
     setTimeout(() => {
       for (const root of getSearchRoots()) {
         for (const b of root.querySelectorAll('button, [role="button"]')) {
-          if (b.getClientRects().length === 0) continue;
-          const t = (b.innerText || b.textContent || '').trim().replace(/\s+/g, ' ');
+          if (!isVisible(b)) continue;
+          const t = textOf(b);
           if (!SAVE_TEXT.test(t)) continue;
+          if (isUnsafeHref(b)) continue;
           if (!(looksLikeBannerContainer(b) || nearbyCookieText(b))) continue;
           b.click();
-          if (!bannerHandled) {
-            rejectClicked = true;
-            bannerHandled = true;
-            unlockScroll();
-            notifyBlocked();
-          }
+          markBannerHandled();
           return;
         }
       }
@@ -263,14 +229,12 @@
     for (const root of getSearchRoots()) {
       const candidates = root.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');
       for (const el of candidates) {
-        // offsetParent is unreliable inside shadow roots; use client rects
-        if (el.getClientRects().length === 0) continue; // hidden
-        // innerText (not textContent) respects CSS visibility, so responsive
-        // buttons with two text spans (one hidden per breakpoint, e.g.
-        // "Reject" / "Reject All Cookies") don't concatenate into garbage.
-        const text = (el.tagName === 'INPUT' ? el.value : el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+        if (!isVisible(el)) continue;
+        const text = textOf(el);
         if (!text || text.length > 60) continue;
         if (!REJECT_TEXT.test(text)) continue;
+        // A "reject" that links to another page leaves the site, it refuses nothing.
+        if (isUnsafeHref(el) || leavesPage(el)) continue;
         // A reject button revealed inside a Customize/Preferences panel (e.g.
         // Radix Dialog) often sits under ancestors with no semantic hint at
         // all, just an auto-generated id via aria-labelledby. Text this
@@ -294,7 +258,7 @@
     outer: for (const sel of CMP_REJECT_SELECTORS) {
       for (const root of roots) {
         const btn = root.querySelector(sel);
-        if (btn && btn.getClientRects().length > 0) {
+        if (btn && isVisible(btn)) {
           btn.click();
           rejectClicked = true;
           break outer;
@@ -307,11 +271,7 @@
     if (!rejectClicked) tryCustomizeFlow();
     if (!rejectClicked) tryToggleSave();
 
-    if (rejectClicked && !bannerHandled) {
-      bannerHandled = true;
-      unlockScroll();
-      notifyBlocked();
-    }
+    if (rejectClicked) markBannerHandled();
     return rejectClicked;
   }
 
@@ -354,8 +314,8 @@
     const candidates = [];
     for (const root of getSearchRoots()) {
       for (const el of root.querySelectorAll('button, a, [role="button"]')) {
-        if (el.getClientRects().length === 0) continue;
-        const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+        if (!isVisible(el)) continue;
+        const text = textOf(el);
         if (!text || text.length > 80) continue;
         candidates.push({ selector: buildSelector(el), text });
         if (candidates.length >= 40) return candidates;
@@ -364,8 +324,7 @@
     return candidates;
   }
 
-  const ACCEPT_LIKE = /accept|agree|allow|enable|got it|ok(ay)?$/i;
-  const REJECT_LIKE = /reject|decline|refuse|deny|disagree|necessary|essential/i;
+  const { ACCEPT_LIKE, REJECT_LIKE } = vocab;
 
   let aiRecipeTried = false;
 
@@ -395,12 +354,13 @@
         el = root.querySelector(step.selector);
         if (el) break;
       }
-      if (!el || el.getClientRects().length === 0) return;
-      const text = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+      if (!el || !isVisible(el)) return;
+      const text = textOf(el);
       // The live element must still say what the recipe recorded, and must
       // never be accept-like. Abort entirely on any mismatch.
       if (!text || !step.expectText || !text.toLowerCase().startsWith(String(step.expectText).toLowerCase().slice(0, 40))) return;
       if (ACCEPT_LIKE.test(text) && !REJECT_LIKE.test(text)) return;
+      if (isUnsafeHref(el) || leavesPage(el)) return;
       el.click();
       lastText = text;
       await new Promise((r) => setTimeout(r, 900));
@@ -408,12 +368,7 @@
       if (attemptReject()) return;
     }
 
-    if (REJECT_LIKE.test(lastText) && !bannerHandled) {
-      rejectClicked = true;
-      bannerHandled = true;
-      unlockScroll();
-      notifyBlocked();
-    }
+    if (REJECT_LIKE.test(lastText)) markBannerHandled();
   }
 
   // Resolves once the banner loop has finished (rejected, or given up), so
@@ -522,12 +477,15 @@
   }
 
   // ---------------------------------------------------------------
-  // In-page toast: alerts the user on risky sites (popup can't auto-open)
+  // In-page toast: alerts the user on risky sites (popup can't auto-open).
+  // Risky means the privacy policy misses at least half of the DPDP notice
+  // basics (shared/notice-checks.js, checked in background.js).
   // ---------------------------------------------------------------
-  const GRADE_COLORS = { A: '#16a34a', B: '#65a30d', C: '#d97706', D: '#dc2626', F: '#991b1b' };
+  const RISKY_COLOR = '#dc2626';
 
   async function maybeShowToast(result) {
-    const risky = result && (result.grade === 'D' || result.grade === 'F');
+    const missing = result && result.status === 'checked' ? result.total - result.found : 0;
+    const risky = missing > 0 && missing * 2 >= result.total;
     if (!risky && !bannerHandled) return;
     if (!extAlive()) return;
 
@@ -544,74 +502,14 @@
 
     const lines = [];
     if (bannerHandled) lines.push('Cookie tracking auto-rejected');
-    if (risky) lines.push(`Privacy grade ${result.grade}, think twice before sharing personal data here`);
-    showToast(risky ? result.grade : null, lines);
-  }
-
-  function showToast(grade, lines) {
-    const toast = document.createElement('div');
-    toast.setAttribute('style', [
-      'position:fixed', 'bottom:20px', 'right:20px', 'z-index:2147483647',
-      'display:flex', 'align-items:flex-start', 'gap:10px',
-      'max-width:320px', 'padding:12px 14px',
-      'background:#ffffff', 'color:#202124',
-      'border:1px solid #e8eaed',
-      `border-left:4px solid ${grade ? GRADE_COLORS[grade] : '#2563eb'}`,
-      'border-radius:10px',
-      'box-shadow:0 10px 40px -10px rgba(0,0,0,0.25)',
-      'font-family:Lato,-apple-system,Segoe UI,Roboto,sans-serif',
-      'font-size:13px', 'line-height:1.45',
-      'transition:opacity .4s, transform .4s',
-    ].join(';') + ';');
-
-    const badge = document.createElement('div');
-    badge.textContent = grade || '🧿';
-    badge.setAttribute('style', [
-      'flex-shrink:0', 'width:34px', 'height:34px', 'border-radius:50%',
-      'display:flex', 'align-items:center', 'justify-content:center',
-      'font-weight:800', 'font-size:16px', 'color:#fff',
-      `background:${grade ? GRADE_COLORS[grade] : '#2563eb'}`,
-    ].join(';') + ';');
-
-    const body = document.createElement('div');
-    const title = document.createElement('div');
-    title.textContent = '🧿 Nazar';
-    title.setAttribute('style', 'font-weight:800;margin-bottom:2px;color:#202124;');
-    body.appendChild(title);
-    for (const line of lines) {
-      const p = document.createElement('div');
-      p.textContent = line;
-      p.setAttribute('style', 'color:#3c4043;');
-      body.appendChild(p);
+    if (risky) {
+      lines.push(`The privacy policy misses ${missing} of ${result.total} DPDP basics, think twice before sharing personal data here`);
     }
-    const hint = document.createElement('div');
-    hint.textContent = 'Click the 🧿 icon in your toolbar for details';
-    hint.setAttribute('style', 'color:#80868b;font-size:11px;margin-top:4px;');
-    body.appendChild(hint);
-
-    const brand = document.createElement('div');
-    brand.setAttribute('style', 'display:flex;align-items:center;gap:4px;margin-top:6px;color:#80868b;font-size:10px;');
-    const by = document.createElement('span');
-    by.textContent = 'by';
-    const logo = document.createElement('img');
-    logo.src = chrome.runtime.getURL('assets/brand/logo-side.svg');
-    logo.alt = 'Privacy Labs';
-    logo.setAttribute('style', 'height:10px;width:auto;display:block;');
-    brand.append(by, logo);
-    body.appendChild(brand);
-
-    const close = document.createElement('button');
-    close.textContent = '×';
-    close.setAttribute('style', 'background:none;border:none;color:#80868b;font-size:16px;cursor:pointer;padding:0 2px;line-height:1;');
-    close.addEventListener('click', () => toast.remove());
-
-    toast.append(badge, body, close);
-    (document.body || document.documentElement).appendChild(toast);
-    setTimeout(() => {
-      toast.style.opacity = '0';
-      toast.style.transform = 'translateY(8px)';
-      setTimeout(() => toast.remove(), 450);
-    }, 8000);
+    toast.show({
+      badge: risky ? `${result.found}/${result.total}` : undefined,
+      color: risky ? RISKY_COLOR : undefined,
+      lines,
+    });
   }
 
   // ---------------------------------------------------------------
@@ -635,7 +533,7 @@
     for (const sel of CMP_CONTAINER_SELECTORS) {
       for (const root of roots) {
         const el = root.querySelector(sel);
-        if (el && el.getClientRects().length > 0) return true;
+        if (el && isVisible(el)) return true;
       }
     }
     // Generic: a viewport-anchored element that talks about cookies and has
@@ -645,7 +543,7 @@
         let cs;
         try { cs = getComputedStyle(el); } catch { continue; }
         if (cs.position !== 'fixed' && cs.position !== 'sticky') continue;
-        if (el.getClientRects().length === 0) continue;
+        if (!isVisible(el)) continue;
         const text = (el.innerText || '').slice(0, 500);
         if (text.length > 600 || !/cookie|consent/i.test(text)) continue;
         const hasControl = [...el.querySelectorAll('button, a, [role="button"]')].some((b) =>
@@ -659,25 +557,103 @@
     return false;
   }
 
+  // ---------------------------------------------------------------
+  // Fetch the policy page from HERE (the page's own JS context), not from
+  // the background service worker. A service-worker fetch() carries none
+  // of the page's cookies and reports sec-fetch-site as cross-origin,
+  // which reads as bot-like to Cloudflare/WAF-protected sites. A
+  // same-origin fetch issued from the page itself carries real cookies
+  // and a real Referer, so it looks like an ordinary in-page request.
+  const GOOD_POLICY_MIN_CHARS = 1500;
+
+  async function fetchPolicyPage(url) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+      const html = await res.text();
+      const text = htmlToPolicyText(html);
+      return { url, html, text };
+    } catch {
+      return null;
+    }
+  }
+
+  function htmlToPolicyText(html) {
+    return html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;|&#160;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function extractPolicyLinks(html, baseUrl) {
+    const links = [];
+    const re = /href\s*=\s*["']([^"'#]+)["']/gi;
+    let m;
+    while ((m = re.exec(html)) !== null && links.length < 10) {
+      const raw = m[1];
+      if (!/privacy|dpdp|data[-_]?protection|policy/i.test(raw)) continue;
+      try {
+        const abs = new URL(raw, baseUrl).href;
+        if (/^https?:/.test(abs)) links.push(abs);
+      } catch { /* ignore bad hrefs */ }
+    }
+    return links;
+  }
+
+  async function fetchBestPolicyText(policyUrls) {
+    const queue = [...(policyUrls || [])];
+    const tried = new Set();
+    let best = { url: null, text: '' };
+    while (queue.length > 0 && tried.size < 4) {
+      const url = queue.shift();
+      if (!url || tried.has(url)) continue;
+      tried.add(url);
+      const page = await fetchPolicyPage(url);
+      if (!page) continue;
+      if (page.text.length > best.text.length) best = { url: page.url, text: page.text };
+      if (best.text.length >= GOOD_POLICY_MIN_CHARS) return best;
+      for (const link of extractPolicyLinks(page.html, page.url)) {
+        if (!tried.has(link)) queue.push(link);
+      }
+    }
+    return best;
+  }
+
   function report() {
     if (!extAlive()) return;
-    try {
-      chrome.runtime.sendMessage(
-        {
-          action: 'pageReady',
-          origin: location.origin,
-          policyUrl: findPolicyLink(),
-          policyUrls: findPolicyLinks(),
-          trackers: detectTrackers(),
-          bannerBlocked: bannerHandled,
-          bannerPresent: bannerHandled || detectBannerPresent(),
-        },
-        (result) => {
-          if (chrome.runtime.lastError) return;
-          maybeShowToast(result);
-        }
-      );
-    } catch { /* context gone */ }
+    const bannerPresent = bannerHandled || detectBannerPresent();
+    if (bannerPresent && !bannerHandled) {
+      activity.record({
+        kind: activity.KIND.COOKIE,
+        decision: activity.DECISION.FLAGGED,
+        label: 'Cookie banner',
+        reason: 'No way to refuse',
+      });
+    }
+    fetchBestPolicyText(findPolicyLinks()).then((best) => {
+      if (!extAlive()) return;
+      try {
+        chrome.runtime.sendMessage(
+          {
+            action: 'pageReady',
+            origin: location.origin,
+            policyUrl: best.url || findPolicyLink(),
+            policyUrls: findPolicyLinks(),
+            policyText: best.text,
+            trackers: detectTrackers(),
+            bannerBlocked: bannerHandled,
+            bannerPresent,
+          },
+          (result) => {
+            if (chrome.runtime.lastError) return;
+            maybeShowToast(result);
+          }
+        );
+      } catch { /* context gone */ }
+    });
   }
 
   // Report only once the banner loop has settled, so the popup reflects the
@@ -697,6 +673,12 @@
   }
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    // Used by the popup's "Re-analyze policy" button: re-fetch fresh text
+    // from the page's own context.
+    if (msg.action === 'fetchPolicyText') {
+      fetchBestPolicyText(msg.policyUrls || findPolicyLinks()).then(sendResponse);
+      return true;
+    }
     if (msg.action === 'getPageReport') {
       sendResponse({
         host: HOST,
@@ -706,6 +688,7 @@
         trackers: detectTrackers(),
         policyUrl: findPolicyLink(),
         policyUrls: findPolicyLinks(),
+        actions: activity.list(),
       });
     }
   });

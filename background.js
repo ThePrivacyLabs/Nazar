@@ -1,24 +1,36 @@
 // Nazar: background service worker
-// Fetches privacy policies, scores them, caches results, and paints the tab badge.
+// Checks privacy policies against the DPDP notice checklist, caches the
+// result, paints the tab badge, and keeps the activity history.
 
-const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days (regex results)
-const AI_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days (AI results)
+importScripts('shared/notice-checks.js');
 
-// AI backend (holds the Anthropic key server-side; the extension never sees it).
+const AI_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days (AI policy reads, banner recipes)
+// A text-match result is kept a day only, so a site checked while AI was
+// off or out of budget is read by AI on a later visit.
+const TEXT_NOTICE_TTL_MS = 24 * 60 * 60 * 1000;
+// What the AI reads of a policy; the server reads the same amount.
+const AI_POLICY_CHARS = 24000;
+// Shorter than this, the policy link gave no readable text (a script-only
+// shell, a block page), and every check would wrongly read as missing.
+const MIN_POLICY_CHARS = 500;
+
+// AI backend: reads privacy policies and finds reject buttons on unusual
+// cookie banners (holds the Anthropic key server-side; the extension never
+// sees it). Its answers are cached on the server per site, so a site is
+// read once for everyone.
 // Override for local testing via settings.apiUrl (e.g. http://localhost:3000/...).
 const NAZAR_API = 'https://theprivacylabs.com/api/nazar/analyze';
-const AI_DAILY_CAP = 25; // client-side cap; the server enforces its own too
+const AI_DAILY_CAP = 100; // client-side cap; the server enforces its own too
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'pageReady') {
     handlePageReady(msg, sender.tab).then(sendResponse).catch(() => sendResponse(null));
     return true;
   }
-  if (msg.action === 'getScore') {
-    // The grade reflects the site's PRIVACY POLICY only. Tracker behaviour is
-    // shown separately in the popup as plain facts (blocked / also present),
-    // never folded into the letter grade.
-    getScore(msg.origin, msg.policyUrls || [msg.policyUrl], msg.forceRefresh)
+  if (msg.action === 'checkNotice') {
+    // policyText arrives pre-fetched from the content script (page context:
+    // real cookies, real referer), not fetched here.
+    getNoticeChecks(msg.origin, msg.policyUrl, msg.policyText, msg.forceRefresh)
       .then((result) => sendResponse(result))
       .catch(() => sendResponse(null));
     return true;
@@ -27,8 +39,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     getBannerRecipe(msg.origin, msg.candidates).then(sendResponse).catch(() => sendResponse(null));
     return true;
   }
-  if (msg.action === 'bannerBlocked') {
-    bumpBannerStats(msg.host);
+  if (msg.action === 'controlClick') {
+    rememberControlClick(sender.tab, msg.label);
+  }
+  if (msg.action === 'getLastControlClick') {
+    lastControlClick(sender.tab).then(sendResponse).catch(() => sendResponse(null));
+    return true;
+  }
+  if (msg.action === 'logActivity') {
+    const entry = recordActivity(msg.entry, sender.tab);
+    // Recorded inside a frame (a consent tool's iframe): the top frame owns
+    // the page's list and the in-page note, so pass it on.
+    if (entry && sender.frameId && sender.tab) {
+      chrome.tabs.sendMessage(sender.tab.id, { action: 'frameActivity', entry, notice: msg.notice || null }, { frameId: 0 })
+        .catch(() => {});
+    }
+  }
+  if (msg.action === 'amendActivity') {
+    const patch = amendActivity(msg.id, msg.patch);
+    if (patch && sender.frameId && sender.tab) {
+      chrome.tabs.sendMessage(sender.tab.id, { action: 'frameActivityAmend', id: msg.id, patch }, { frameId: 0 })
+        .catch(() => {});
+    }
+  }
+  if (msg.action === 'reportSite') {
+    sendReport(msg).then(sendResponse).catch(() => sendResponse(false));
+    return true;
+  }
+  if (msg.action === 'clearActivity') {
+    clearActivity().then(() => sendResponse(true)).catch(() => sendResponse(false));
+    return true;
   }
   if (msg.action === 'getSiteAllow') {
     isSiteAllowed(msg.host).then(sendResponse).catch(() => sendResponse(false));
@@ -100,7 +140,15 @@ chrome.runtime.onStartup.addListener(async () => {
 chrome.runtime.onInstalled.addListener(async () => {
   const { allowedSites = [] } = await chrome.storage.local.get('allowedSites');
   if (allowedSites.length) syncAllowRules(allowedSites);
+  dropLegacyGrades();
 });
+
+// The A-F grades cached by versions before the checklist ('policy:<origin>').
+async function dropLegacyGrades() {
+  const all = await chrome.storage.local.get(null);
+  const stale = Object.keys(all).filter((k) => k.startsWith('policy:'));
+  if (stale.length) await chrome.storage.local.remove(stale);
+}
 
 // ------------------------------------------------------------------
 // AI budget guards
@@ -145,123 +193,89 @@ async function callNazarApi(payload) {
 
 async function handlePageReady(msg, tab) {
   if (!tab || !tab.id) return null;
-  // Grade = policy only. Trackers are a separate factual display in the popup.
-  const result = await getScore(msg.origin, msg.policyUrls || [msg.policyUrl], false);
+  const result = await getNoticeChecks(msg.origin, msg.policyUrl, msg.policyText, false);
   setBadge(tab.id, result);
   return result;
 }
 
 // ------------------------------------------------------------------
-// Policy text acquisition. Fetches happen HERE, in the user's browser,
-// never on the server: browser requests carry a real UA and aren't bot-
-// blocked the way datacenter requests are. If a fetched page turns out to
-// be a nav menu or JS shell (barely any text), follow the privacy-looking
-// links inside it, up to 4 fetches total, and keep the meatiest page.
+// The DPDP notice checklist for a site's privacy policy: the six things the
+// DPDP Rules say a notice must tell you. The AI backend reads the policy
+// first; the text match (shared/notice-checks.js) is the backup, and also
+// answers any single item the AI could not back with a quote from the
+// policy. The policy text is fetched by the content script, in the page's
+// own JS context (real cookies, real Referer), so WAF-protected sites see
+// an ordinary in-page request instead of a bot-like service-worker fetch.
+//
+// Results, by status:
+//   checked     { source: 'ai' | 'text', checks: [{ key, found, quote,
+//               note, by }], found, total, policyUrl }
+//   no-policy   the page links no privacy policy
+//   unreadable  the link gave no readable text; or the AI says it is not a
+//               privacy policy; or, by text match alone, not one check is
+//               found (a real policy at least says what it collects, so a
+//               0/6 is almost always a link that landed on a home or help
+//               page, and must not be shown as a bad policy)
+// Only "checked" is cached: the other two may differ on the next page.
 // ------------------------------------------------------------------
-const GOOD_POLICY_MIN_CHARS = 1500;
-
-async function fetchPolicyPage(url) {
-  try {
-    const res = await fetch(url, { credentials: 'omit', signal: AbortSignal.timeout(12000) });
-    const html = await res.text();
-    return { url, html, text: htmlToText(html) };
-  } catch {
-    return null;
-  }
-}
-
-function extractPolicyLinks(html, baseUrl) {
-  const links = [];
-  const re = /href\s*=\s*["']([^"'#]+)["']/gi;
-  let m;
-  while ((m = re.exec(html)) !== null && links.length < 10) {
-    const raw = m[1];
-    if (!/privacy|dpdp|data[-_]?protection|policy/i.test(raw)) continue;
-    try {
-      const abs = new URL(raw, baseUrl).href;
-      if (/^https?:/.test(abs)) links.push(abs);
-    } catch { /* ignore bad hrefs */ }
-  }
-  return links;
-}
-
-async function fetchBestPolicyText(policyUrls) {
-  const queue = [...policyUrls];
-  const tried = new Set();
-  let best = { url: null, text: '' };
-  while (queue.length > 0 && tried.size < 4) {
-    const url = queue.shift();
-    if (!url || tried.has(url)) continue;
-    tried.add(url);
-    const page = await fetchPolicyPage(url);
-    if (!page) continue;
-    if (page.text.length > best.text.length) best = { url: page.url, text: page.text };
-    if (best.text.length >= GOOD_POLICY_MIN_CHARS) return best;
-    // Thin page: it's probably a menu or hub, follow its policy-ish links
-    for (const link of extractPolicyLinks(page.html, page.url)) {
-      if (!tried.has(link)) queue.push(link);
-    }
-  }
-  return best;
-}
-
-async function getScore(origin, policyUrls, forceRefresh) {
+async function getNoticeChecks(origin, policyUrl, policyText, forceRefresh) {
   if (!origin) return null;
-  policyUrls = (policyUrls || []).filter(Boolean);
-  const key = 'policy:' + origin;
+  const key = 'notice:' + origin;
   const cached = (await chrome.storage.local.get(key))[key];
-  if (!forceRefresh && cached) {
-    // Only results from the current AI prompt version get the long TTL;
-    // regex results and old-prompt AI results are upgrade candidates.
-    const isCurrentAi = cached.source === 'ai' && cached.v === 2;
-    const ttl = isCurrentAi ? AI_CACHE_TTL_MS : CACHE_TTL_MS;
-    if (Date.now() - cached.ts < ttl) {
-      const upgradable =
-        !isCurrentAi &&
-        Date.now() - (cached.aiTriedTs || 0) > 24 * 60 * 60 * 1000 &&
-        (await aiAllowed());
-      if (!upgradable) return cached;
-    }
-  }
-  if (policyUrls.length === 0) {
-    const result = { origin, grade: '?', score: null, good: [], bad: ['No privacy policy link found on this page'], policyUrl: null, ts: Date.now() };
-    await chrome.storage.local.set({ [key]: result });
-    return result;
-  }
+  const ttl = cached && cached.source === 'ai' ? AI_CACHE_TTL_MS : TEXT_NOTICE_TTL_MS;
+  if (!forceRefresh && cached && Date.now() - cached.ts < ttl) return cached;
 
-  const best = await fetchBestPolicyText(policyUrls);
-  if (!best.text) {
-    return { origin, grade: '?', score: null, good: [], bad: ['Could not fetch the privacy policy'], policyUrl: policyUrls[0], ts: Date.now() };
-  }
+  const base = { origin, policyUrl: policyUrl || null, ts: Date.now() };
+  if (!policyUrl) return { ...base, status: 'no-policy' };
+  if (!policyText || policyText.trim().length < MIN_POLICY_CHARS) return { ...base, status: 'unreadable' };
 
-  // AI path: the browser-fetched text goes to the backend, so the model
-  // reads exactly what the user's browser sees. Any failure, cap, opt-out,
-  // or "this is not actually a policy" verdict falls through to regex.
-  if (await aiAllowed()) {
-    // Pages often open with thousands of chars of nav/menu boilerplate.
-    // Start the 24K window where the actual policy content begins so
-    // truncation never eats the document itself.
-    const startIdx = best.text.search(/privacy policy|personal (data|information)|information we collect|data we collect/i);
-    const from = startIdx > 300 ? startIdx - 100 : 0;
-    const ai = await callNazarApi({
-      type: 'policy',
-      origin,
-      policyUrl: best.url,
-      policyText: best.text.slice(from, from + 24000),
-      forceRefresh: !!forceRefresh,
-    });
-    if (ai && ai.grade && ai.grade !== '?' && !ai.insufficient) {
-      const result = { ...ai, ts: Date.now() };
-      await chrome.storage.local.set({ [key]: result });
-      return result;
-    }
-  }
+  const byText = NazarNotice.checkNotice(policyText).map((c) => ({ ...c, note: '', by: 'text' }));
+  const ai = (await aiAllowed()) ? await readNoticeWithAi(origin, policyUrl, policyText, forceRefresh) : null;
+  if (ai && ai.insufficient) return { ...base, status: 'unreadable' };
 
-  // aiTriedTs records that AI was attempted and failed, so the upgrade
-  // check above retries at most once a day instead of on every page load.
-  const result = { origin, policyUrl: best.url, ts: Date.now(), source: 'regex', aiTriedTs: Date.now(), ...scorePolicy(best.text) };
+  const checks = ai ? mergeNoticeChecks(ai, byText) : byText;
+  const found = checks.filter((c) => c.found).length;
+  if (!ai && found === 0) return { ...base, status: 'unreadable' };
+  const result = { ...base, status: 'checked', source: ai ? 'ai' : 'text', checks, found, total: NazarNotice.TOTAL };
   await chrome.storage.local.set({ [key]: result });
   return result;
+}
+
+// The AI's read of the policy, or null when it is off, over budget, down,
+// or answered something other than the six items.
+async function readNoticeWithAi(origin, policyUrl, policyText, forceRefresh) {
+  // Pages often open with thousands of chars of navigation. Start the
+  // window where the policy itself begins, so truncation never eats it.
+  const start = policyText.search(/privacy policy|personal (data|information)|information we collect|data we collect/i);
+  const from = start > 300 ? start - 100 : 0;
+  const ai = await callNazarApi({
+    type: 'notice',
+    origin,
+    policyUrl,
+    policyText: policyText.slice(from, from + AI_POLICY_CHARS),
+    forceRefresh: !!forceRefresh,
+  });
+  if (!ai) return null;
+  if (ai.insufficient) return ai;
+  const keys = new Set((Array.isArray(ai.items) ? ai.items : []).map((i) => i && i.key));
+  return NazarNotice.CHECKS.every((c) => keys.has(c.key)) ? ai : null;
+}
+
+// One row per check, from the AI where it can stand behind its answer:
+//   AI found it, with a quote the server found in the policy  -> AI
+//   AI found it, but its quote is not in the policy           -> text match
+//   AI did not find it, but only read part of a long policy,
+//     and the text match finds it in the rest                 -> text match
+//   AI did not find it                                        -> not found
+function mergeNoticeChecks(ai, byText) {
+  const aiByKey = new Map(ai.items.map((item) => [item.key, item]));
+  return byText.map((text) => {
+    const item = aiByKey.get(text.key);
+    const note = clipText(item.note, 90);
+    if (item.found && item.quote) return { key: text.key, found: true, quote: clipText(item.quote, 200), note, by: 'ai' };
+    if (item.found || (ai.truncated && text.found)) return text;
+    return { key: text.key, found: false, quote: '', note, by: 'ai' };
+  });
 }
 
 // ------------------------------------------------------------------
@@ -283,91 +297,171 @@ async function getBannerRecipe(origin, candidates) {
   return result;
 }
 
-function htmlToText(html) {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;|&#160;/g, ' ')
-    .replace(/&amp;/g, '&')
-    // Normalize smart quotes to straight quotes and drop other punctuation
-    // marks entirely so a wrapped word like `don't "sell"` still matches
-    // regexes that expect the word to sit right after whitespace.
-    .replace(/[‘’“”«»]/g, "'")
-    .replace(/['"]/g, '')
-    .replace(/\s+/g, ' ')
-    .toLowerCase();
-}
-
 // ------------------------------------------------------------------
-// Heuristic policy scoring: start at 50, add/subtract weighted signals
+// Badge: the checklist tally, "4/6". Green only when nothing is missing.
 // ------------------------------------------------------------------
-const GOOD_SIGNALS = [
-  { re: /(do(es)?\s+not|don.?t|doesn.?t|never|will not)\s+sell\s+(your\s+)?(personal\s+)?(data|information)|no\s+(sale|selling)\s+of\s+(your\s+)?(personal\s+)?(data|information)/, w: 12, label: 'States it does not sell your data' },
-  { re: /right to (erasure|be forgotten|deletion|delete)|(request|requesting)\b.{0,40}(delet(e|ion)|erasure)/, w: 8, label: 'Grants right to delete your data' },
-  { re: /digital personal data protection|dpdp act/, w: 8, label: 'References India’s DPDP Act' },
-  { re: /grievance officer/, w: 6, label: 'Names a grievance officer (DPDP requirement)' },
-  { re: /data protection officer/, w: 5, label: 'Has a data protection officer' },
-  { re: /gdpr|general data protection regulation/, w: 4, label: 'References GDPR' },
-  { re: /encrypt(ed|ion)/, w: 4, label: 'Mentions encryption of data' },
-  { re: /opt[- ]?out/, w: 4, label: 'Provides opt-out mechanisms' },
-  { re: /reten(tion period|tained? for)\s|retain(ed)?\s.{0,40}(days|months|years)/, w: 5, label: 'States a specific data retention period' },
-  { re: /withdraw (your )?consent/, w: 4, label: 'Allows withdrawing consent' },
-  { re: /(download|export|portability of) your (data|information)/, w: 3, label: 'Supports data export / portability' },
-];
-
-const BAD_SIGNALS = [
-  { re: /(sell|sale of)\s+(your\s+)?(personal\s+)?(data|information)/, w: -15, label: 'May sell personal data', unlessGood: 0 },
-  { re: /share\b.{0,80}(third[- ]?part(y|ies)|advertis|partner|affiliate)/, w: -10, label: 'Shares data with third parties / advertisers' },
-  { re: /(retain|store|keep)\b.{0,60}(indefinitely|as long as (necessary|we))/, w: -8, label: 'Vague or indefinite data retention' },
-  { re: /(targeted|interest[- ]based|personali[sz]ed)\s+advertis/, w: -8, label: 'Uses data for targeted advertising' },
-  { re: /(change|update|modify)\b.{0,50}(policy|terms)\b.{0,80}without\s+(prior\s+)?notice/, w: -8, label: 'Can change the policy without notice' },
-  { re: /fingerprint(ing)?|device identifiers?/, w: -5, label: 'Uses device fingerprinting / identifiers' },
-  { re: /(cross[- ]site|third[- ]party)\s+(tracking|cookies)/, w: -6, label: 'Uses third-party tracking cookies' },
-  { re: /transfer\b.{0,60}(outside|other countries|internationally)/, w: -4, label: 'Transfers data across borders' },
-];
-
-function scorePolicy(text) {
-  const good = [];
-  const bad = [];
-  let score = 50;
-
-  if (text.length < 1500) {
-    bad.push('Policy is unusually short or could not be read properly');
-    score -= 10;
-  }
-
-  for (const sig of GOOD_SIGNALS) {
-    if (sig.re.test(text)) { good.push(sig.label); score += sig.w; }
-  }
-  for (const sig of BAD_SIGNALS) {
-    // "does not sell" already matched as good, don't also penalize "sell"
-    if (sig.unlessGood !== undefined && good.includes(GOOD_SIGNALS[sig.unlessGood].label)) continue;
-    if (sig.re.test(text)) { bad.push(sig.label); score += sig.w; }
-  }
-
-  score = Math.max(0, Math.min(100, score));
-  const grade = score >= 80 ? 'A' : score >= 65 ? 'B' : score >= 50 ? 'C' : score >= 35 ? 'D' : 'F';
-  return { score, grade, good, bad };
-}
-
-// ------------------------------------------------------------------
-// Badge
-// ------------------------------------------------------------------
-const GRADE_COLORS = { A: '#16a34a', B: '#65a30d', C: '#d97706', D: '#dc2626', F: '#991b1b', '?': '#6b7280' };
+const BADGE_COLORS = { complete: '#16a34a', gaps: '#dc2626', unknown: '#6b7280' };
 
 function setBadge(tabId, result) {
-  const grade = result && result.grade ? result.grade : '?';
-  chrome.action.setBadgeText({ tabId, text: grade }).catch(() => {});
-  chrome.action.setBadgeBackgroundColor({ tabId, color: GRADE_COLORS[grade] || '#6b7280' }).catch(() => {});
+  const checked = !!result && result.status === 'checked';
+  const text = checked ? `${result.found}/${result.total}` : '?';
+  const color = !checked ? BADGE_COLORS.unknown
+    : result.found === result.total ? BADGE_COLORS.complete : BADGE_COLORS.gaps;
+  chrome.action.setBadgeText({ tabId, text }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ tabId, color }).catch(() => {});
 }
 
 // ------------------------------------------------------------------
-// Stats
+// The last button the person clicked in each tab. A multi-step flow often
+// loads a new page per step, and the consent prompt on step 5 answers the
+// click that ended step 4, which the old page's content script saw and the
+// new one did not. Consent tools also open their notice in their own
+// frame, which never saw the click that opened it. Both ask here.
+// Recorded against the tab's page, not the frame clicked in, and handed
+// back only while the tab is still on the same site. Session storage:
+// gone when the browser closes.
 // ------------------------------------------------------------------
-async function bumpBannerStats(host) {
-  const { stats = { totalBanners: 0, sites: {} } } = await chrome.storage.local.get('stats');
-  stats.totalBanners += 1;
-  stats.sites[host] = (stats.sites[host] || 0) + 1;
-  await chrome.storage.local.set({ stats });
+const clickKey = (tabId) => 'click:' + tabId;
+
+function tabHost(tab) {
+  try { return new URL(tab.url).hostname; } catch { return ''; }
+}
+
+// Equal hosts, or one a subdomain of the other: site.com -> app.site.com
+// is the same site, www.site.com -> app.site.com is not.
+function sameSite(a, b) {
+  const strip = (h) => h.replace(/^www\./, '');
+  a = strip(a);
+  b = strip(b);
+  return !!a && (a === b || a.endsWith('.' + b) || b.endsWith('.' + a));
+}
+
+function rememberControlClick(tab, label) {
+  if (!tab || !tab.id) return;
+  const click = { host: tabHost(tab), ts: Date.now(), label: clipText(label, 60) };
+  chrome.storage.session.set({ [clickKey(tab.id)]: click }).catch(() => {});
+}
+
+async function lastControlClick(tab) {
+  if (!tab || !tab.id) return null;
+  const key = clickKey(tab.id);
+  const click = (await chrome.storage.session.get(key))[key];
+  return click && sameSite(click.host, tabHost(tab)) ? click : null;
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  chrome.storage.session.remove(clickKey(tabId)).catch(() => {});
+});
+
+// ------------------------------------------------------------------
+// Activity: what Nazar did, per popup. The content scripts report; this
+// worker is the only writer, so tabs logging at the same moment cannot
+// overwrite each other. Stored on this device only, newest first.
+// ------------------------------------------------------------------
+const ACTIVITY_CAP = 300;
+const ACTIVITY_KINDS = new Set(['cookie', 'prompt']);
+const ACTIVITY_DECISIONS = new Set(['declined', 'accepted', 'required-only', 'left', 'flagged']);
+// Decisions where Nazar actually answered a popup (the running total).
+const ACTED_DECISIONS = new Set(['declined', 'accepted', 'required-only']);
+
+const clipText = (value, max) => String(value || '').slice(0, max);
+const clipPurposes = (list) => (Array.isArray(list) ? list : []).slice(0, 8).map((p) => clipText(p, 60));
+
+let activityWrites = Promise.resolve();
+function serialized(task) {
+  activityWrites = activityWrites.then(task, task);
+  return activityWrites;
+}
+
+// Returns the stored entry, or null if it was not a valid one. The site is
+// the tab's page, which for a consent tool's frame is the site the person
+// is actually using, not the tool's domain.
+function recordActivity(entry, tab) {
+  if (!entry || !ACTIVITY_KINDS.has(entry.kind) || !ACTIVITY_DECISIONS.has(entry.decision)) return null;
+  const clean = {
+    id: clipText(entry.id, 32),
+    kind: entry.kind,
+    decision: entry.decision,
+    label: clipText(entry.label, 80),
+    reason: clipText(entry.reason, 80),
+    trigger: clipText(entry.trigger, 80),
+    gave: clipPurposes(entry.gave),
+    refused: clipPurposes(entry.refused),
+    host: (tab && tabHost(tab)) || clipText(entry.host, 253),
+    ts: Number(entry.ts) || Date.now(),
+  };
+  serialized(async () => {
+    const { activity = [], stats = { totalBanners: 0, sites: {} } } =
+      await chrome.storage.local.get(['activity', 'stats']);
+    activity.unshift(clean);
+    activity.length = Math.min(activity.length, ACTIVITY_CAP);
+    // stats.totalBanners predates consent prompts; it now counts every
+    // popup Nazar answered, and keeps its name so existing totals carry on.
+    if (ACTED_DECISIONS.has(clean.decision)) {
+      stats.totalBanners += 1;
+      stats.sites[clean.host] = (stats.sites[clean.host] || 0) + 1;
+    }
+    await chrome.storage.local.set({ activity, stats });
+  });
+  return clean;
+}
+
+// Purposes a consent tool named after the entry was written (its confirm
+// step). Returns the clean patch.
+function amendActivity(id, patch) {
+  if (!id || !patch) return null;
+  const clean = { gave: clipPurposes(patch.gave), refused: clipPurposes(patch.refused) };
+  serialized(async () => {
+    const { activity = [] } = await chrome.storage.local.get('activity');
+    const entry = activity.find((e) => e.id === id);
+    if (!entry) return;
+    Object.assign(entry, clean);
+    await chrome.storage.local.set({ activity });
+  });
+  return clean;
+}
+
+function clearActivity() {
+  return serialized(() => chrome.storage.local.set({ activity: [] }));
+}
+
+// ------------------------------------------------------------------
+// "Report this site", from the popup, sent only on the person's click.
+// The host name, not the page address (which can carry tokens or ids),
+// what Nazar did on the page, and the person's note. Same server as the
+// AI backend, so settings.apiUrl redirects both for local testing.
+// Resolves true when the server stored it.
+// ------------------------------------------------------------------
+const REPORT_PROBLEMS = new Set(['not-handled', 'wrong-answer', 'site-broke']);
+
+async function sendReport(msg) {
+  if (typeof msg.host !== 'string' || !REPORT_PROBLEMS.has(msg.problem)) return false;
+  const { settings = {} } = await chrome.storage.local.get('settings');
+  const url = new URL('/api/nazar/report', settings.apiUrl || NAZAR_API);
+  const actions = (Array.isArray(msg.actions) ? msg.actions : []).slice(-20).map((a) => ({
+    kind: a.kind,
+    decision: a.decision,
+    label: clipText(a.label, 80),
+    reason: clipText(a.reason, 80),
+    trigger: clipText(a.trigger, 80),
+    gave: clipPurposes(a.gave),
+    refused: clipPurposes(a.refused),
+  }));
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        host: msg.host,
+        problem: msg.problem,
+        note: clipText(msg.note, 500),
+        actions,
+        extensionVersion: chrome.runtime.getManifest().version,
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }

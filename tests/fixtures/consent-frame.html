@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Consent tool frame</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; }
+    .confirm { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; }
+    .confirm > div { background: #fff; padding: 20px; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <!-- Modelled on a consent tool's hosted notice (demo.datarakshaq.com):
+       served from another origin inside an iframe, the whole document is
+       the prompt, it is far longer than a banner, its fine print mentions
+       cookies, "Reject all" also refuses the required purposes,
+       "Accept selected" asks for a second confirmation, and, like a
+       server-rendered page, its buttons show before they are wired up. -->
+  <h1>We Value Your Privacy</h1>
+  <p>Please review and manage your consent preferences below. You have the right to accept or deny each purpose individually.</p>
+  <section id="notice"></section>
+  <h2>Required Consents</h2>
+  <p>These consents are required for us to provide our services. They cannot be refused.</p>
+  <ul><li>Account Creation (Selected)</li><li>Service Communication &amp; OTP (Selected)</li></ul>
+  <button id="reject">Reject all</button>
+  <button id="selected">Accept selected</button>
+  <button id="all">Accept all</button>
+  <p><a href="#">Withdraw consent</a> · <a href="#">File a grievance</a></p>
+
+  <script>
+    // Rule 3 notices run to thousands of words; this one mentions cookies in
+    // its fine print, as real ones do.
+    const para = 'We process your personal data only for the purposes listed, retain it only as long as needed, and share it only with the processors named in our sub-processor registry. We also use strictly necessary cookies to keep you signed in. ';
+    document.getElementById('notice').textContent = para.repeat(25);
+
+    const answer = (value) => parent.postMessage({ consentFrame: value }, '*');
+    // Wired up 600ms after the buttons appear, as a page's code does once
+    // it has loaded over the network: clicks before then do nothing.
+    setTimeout(wireUp, 600);
+    function wireUp() {
+      document.getElementById('reject').onclick = () => answer('rejected-everything');
+      document.getElementById('all').onclick = () => answer('accepted-everything');
+      document.getElementById('selected').onclick = () => {
+        const confirm = document.createElement('div');
+        confirm.className = 'confirm';
+        confirm.innerHTML = `<div>
+          <h3>Confirm your choice</h3>
+          <p>Accept selected. This action is logged as a legal record. Granting: Account Creation.</p>
+          <button id="back">Back</button><button id="submit">Confirm &amp; Submit</button>
+        </div>`;
+        confirm.querySelector('#back').onclick = () => confirm.remove();
+        confirm.querySelector('#submit').onclick = () => answer('required-only');
+        document.body.appendChild(confirm);
+      };
+    }
+  </script>
+</body>
+</html>

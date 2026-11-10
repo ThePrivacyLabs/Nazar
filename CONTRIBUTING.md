@@ -25,8 +25,10 @@ change in [`content/cookie-shield.js`](content/cookie-shield.js):
   `CMP_REJECT_SELECTORS`.
 - **Banner hidden by CSS:** add its container selector to
   [`content/cookie-shield.css`](content/cookie-shield.css).
-- **Generic patterns:** the `REJECT_TEXT` and `CUSTOMIZE_TEXT` regexes catch
-  button wording. If a banner uses phrasing we miss, add it there.
+- **Generic patterns:** the `DECLINE` and `CUSTOMIZE` regexes in
+  [`content/lib/vocab.js`](content/lib/vocab.js) catch button wording. Both the
+  cookie shield and the consent-popup handler read them, so phrasing added
+  there works for both.
 
 **How to find the selector:** open the banner, right-click the reject button →
 Inspect, and note its `id`/`class`/`data-*` attribute or exact text. If the
@@ -58,10 +60,44 @@ rule-id → company-name mapping in [`popup/tracker-rules.js`](popup/tracker-rul
 Do **not** block domains that break sites (e.g. Google Tag Manager is
 deliberately left out).
 
+## Testing
+
+[`tests/`](tests/) drives real popups at the unpacked extension in Chromium.
+It is not part of the extension: leave `tests/` out of the store zip.
+
+```
+cd tests
+npm install
+npm test                  # local fixtures, one per popup type
+npm run test:unit         # the privacy policy checklist
+npm test -- --live        # also theprivacylabs.com/book-demo
+npm test -- --headed      # watch it run
+npm test -- --shots       # popup + history screenshots in tests/out
+```
+
+When a real site misbehaves, walk it with Nazar loaded and see what Nazar
+did at each step, what is on screen, and what sits in iframes:
+
+```
+node probe.mjs https://site.example "Sign up" "fill:#email=a@b.co" "Continue" "frame:Accept selected"
+```
+
+Steps are button text to click, `fill:<selector>=<value>`, `type:<selector>=<keys>`
+(for split OTP boxes), or `frame:<button text>` to click inside the first
+iframe by hand. Screenshots of each step land in `tests/out`.
+
+A new popup type, or a site Nazar gets wrong, starts as a case in
+[`tests/fixtures/prompts.html`](tests/fixtures/prompts.html): the right answer
+first, then the fix. Cases where Nazar must do nothing (a form, a destructive
+confirm) matter as much as the ones where it acts.
+
 ## Code style
 
 - Plain modern JavaScript, no framework, no transpiler. Match the surrounding
   style.
+- Anything more than one content script needs goes in `content/lib/`, on the
+  `globalThis.Nazar` namespace, and is listed before its users in
+  `manifest.json`.
 - Comments explain **why**, not what. The existing files are heavily commented —
   follow that density.
 - Keep the extension usable with **zero permissions beyond what's declared**. New
@@ -73,16 +109,18 @@ If you're self-hosting the optional AI backend, the extension calls it as:
 
 **`POST` (JSON) → your endpoint** (`NAZAR_API` in `background.js`)
 
-Policy grading:
+Privacy policy check:
 ```json
-{ "type": "policy", "origin": "https://site.com",
+{ "type": "notice", "origin": "https://site.com",
   "policyUrl": "https://site.com/privacy", "policyText": "…", "forceRefresh": false }
 ```
-Response:
+Response, one item per check in `shared/notice-checks.js`, each found item
+quoting the policy word for word (the server drops any quote not in the text):
 ```json
-{ "grade": "B", "score": 78, "good": ["…"], "bad": ["…"],
-  "summary": "one short line", "source": "ai", "cached": false }
+{ "v": 1, "isPolicy": true, "truncated": false, "source": "ai", "cached": false,
+  "items": [ { "key": "withdraw", "found": true, "quote": "…", "note": "…" }, … ] }
 ```
+`{ "insufficient": true }` means the text was not a privacy policy.
 
 Banner recipe (when heuristics fail):
 ```json
@@ -98,10 +136,24 @@ The backend must: keep the LLM API key server-side, validate that banner steps
 never target accept-style buttons, and cap spend (per-day and per-IP). The
 extension treats any error, timeout, or cap as "fall back to local heuristics."
 
+"Report this site" posts to `/api/nazar/report` on the same server:
+```json
+{ "host": "site.com", "problem": "not-handled | wrong-answer | site-broke",
+  "note": "…", "extensionVersion": "0.4.0",
+  "actions": [ { "kind": "prompt", "decision": "declined", "label": "…", "reason": "…",
+                 "trigger": "…", "gave": [], "refused": ["…"] } ] }
+```
+The host is a bare host name, never a URL. Answer `201` when stored.
+
+The text-match fallback for the privacy policy check needs no backend: it is
+[`shared/notice-checks.js`](shared/notice-checks.js), one pattern list per
+check. A policy wording a check misses is a pattern to add there, with a case
+in [`tests/unit/notice-checks.test.mjs`](tests/unit/notice-checks.test.mjs).
+
 ## Reporting bugs
 
-Open an issue with the **site URL** and what went wrong (banner not detected,
-wrong grade, page broke, etc.). A screenshot of the banner's HTML (right-click →
+Use **Report this site** in the popup, or open an issue with the **site URL**
+and what went wrong (banner not detected, policy check wrong, page broke, etc.). A screenshot of the banner's HTML (right-click →
 Inspect → Copy outerHTML) makes banner bugs fixable in minutes.
 
 ## License

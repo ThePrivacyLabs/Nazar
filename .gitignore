@@ -6,6 +6,7 @@
 # Local + build artifacts
 node_modules/
 *.zip
+tests/out/
 archive-buildinpublic/
 
 # Unrelated project files that sometimes land in this working directory

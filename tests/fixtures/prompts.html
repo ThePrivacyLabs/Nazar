@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Nazar consent-prompt fixtures</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 24px; }
+    .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+    .card { background: #fff; padding: 24px; border-radius: 8px; max-width: 420px; }
+    .bar { position: fixed; bottom: 0; left: 0; right: 0; background: #fff; padding: 12px; border-top: 1px solid #ccc; }
+    .shell { position: fixed; inset: 0; background: #fff; padding: 24px; z-index: 1000; }
+    button { margin: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Consent-prompt fixtures</h1>
+  <p>Each button raises one kind of popup. Results land in <code>document.body.dataset</code>.</p>
+  <button id="open-optional">Optional purpose</button>
+  <button id="open-required">Required notice</button>
+  <button id="open-itemised">Itemised purposes</button>
+  <button id="open-dialog">Native &lt;dialog&gt;</button>
+  <button id="open-service">Book a demo (asks for what you clicked)</button>
+  <button id="open-gate">Get partner offers (gated)</button>
+  <a id="next-step" href="prompts.html?onload=1">Next step of a flow</a>
+  <button id="open-late">Late-bound handler</button>
+  <button id="open-frame">Consent tool in an iframe</button>
+  <button id="open-shell">Fixed app shell (leave alone)</button>
+  <button id="open-entry">Law firm disclaimer (agree to enter)</button>
+  <button id="open-exit-only">Disclaimer with only a way out (leave alone)</button>
+  <button id="open-form">Signup form (leave alone)</button>
+  <button id="open-destructive">Delete account (leave alone)</button>
+  <button id="open-cookie">Accept-only cookie bar (leave alone)</button>
+
+  <dialog id="native">
+    <h3>Location-based offers</h3>
+    <p>Can we use your location data to show nearby offers? We need your consent.</p>
+    <button id="native-no">Not now</button>
+    <button id="native-yes">Allow</button>
+  </dialog>
+
+  <script>
+    const result = (key, value) => { document.body.dataset[key] = value; };
+
+    function overlay(inner, { cls = 'overlay', attrs = {} } = {}) {
+      const wrap = document.createElement('div');
+      wrap.className = cls;
+      for (const [k, v] of Object.entries(attrs)) wrap.setAttribute(k, v);
+      wrap.innerHTML = inner;
+      return wrap;
+    }
+
+    function button(root, label, onClick) {
+      const b = [...root.querySelectorAll('button')].find((x) => x.textContent === label);
+      b.addEventListener('click', onClick);
+      return b;
+    }
+
+    // Mirrors public/sdk/purpose-layer.js: an optional purpose badged
+    // "Consent Required", with Allow and Decline.
+    function optionalPrompt(title, onAnswer) {
+      const el = overlay(`<div class="card">
+        <div>CONSENT REQUIRED</div>
+        <h3>${title}</h3>
+        <p>We would like your consent to use your contact details for this purpose.</p>
+        <button>Allow</button><button>Decline</button>
+      </div>`);
+      button(el, 'Allow', () => { el.remove(); onAnswer('allowed'); });
+      button(el, 'Decline', () => { el.remove(); onAnswer('declined'); });
+      return el;
+    }
+
+    document.getElementById('open-optional').onclick = () => {
+      const el = optionalPrompt('Marketing emails', (answer) => {
+        result('optional', answer);
+        result('optionalMs', String(Math.round(performance.now() - t0)));
+      });
+      const t0 = performance.now();
+      document.body.appendChild(el);
+    };
+
+    document.getElementById('open-required').onclick = () => {
+      const el = overlay(`<div class="card">
+        <div>REQUIRED</div>
+        <h3>Order processing notice</h3>
+        <p>We need your personal data to deliver your order.</p>
+        <button>I Agree</button>
+      </div>`);
+      button(el, 'I Agree', () => { el.remove(); result('required', 'accepted'); });
+      document.body.appendChild(el);
+    };
+
+    document.getElementById('open-itemised').onclick = () => {
+      const el = overlay(`<div class="card" role="dialog" aria-modal="true">
+        <h3>Choose your purposes</h3>
+        <p>Tick the purposes you consent to.</p>
+        <label><input type="checkbox" name="essential" checked disabled> Account security</label><br>
+        <label><input type="checkbox" name="analytics" checked> Product analytics</label><br>
+        <label><input type="checkbox" name="marketing" checked> Marketing</label><br>
+        <button>Save preferences</button>
+      </div>`);
+      button(el, 'Save preferences', () => {
+        const state = Object.fromEntries([...el.querySelectorAll('input')].map((i) => [i.name, i.checked]));
+        el.remove();
+        result('itemised', JSON.stringify(state));
+      });
+      document.body.appendChild(el);
+    };
+
+    const native = document.getElementById('native');
+    document.getElementById('native-no').onclick = () => { native.close(); result('dialog', 'declined'); };
+    document.getElementById('native-yes').onclick = () => { native.close(); result('dialog', 'allowed'); };
+    document.getElementById('open-dialog').onclick = () => native.showModal();
+
+    // Like /book-demo: the prompt asks for exactly what the click asked for.
+    document.getElementById('open-service').onclick = () => {
+      document.body.appendChild(optionalPrompt('Can we use your details to book your demo?', (answer) => result('service', answer)));
+    };
+
+    // An extra purpose the site will not let you past without: declining
+    // leaves the person where they were.
+    let gateDeclines = 0;
+    document.getElementById('open-gate').onclick = () => {
+      document.body.appendChild(optionalPrompt('Partner offers', (answer) => {
+        if (answer === 'declined') result('gate', 'declined:' + ++gateDeclines);
+        else result('gate', 'allowed');
+      }));
+    };
+
+    // ?onload=1: the same service prompt, raised by the page itself as it
+    // loads. Reached directly, nobody asked for it; reached through
+    // "Next step", it answers that click.
+    if (new URLSearchParams(location.search).has('onload')) {
+      setTimeout(() => {
+        document.body.appendChild(optionalPrompt('Can we use your details to set up your account?', (answer) => result('onload', answer)));
+      }, 300);
+    }
+
+    // Handlers bound 100ms after the prompt appears, as some UI libraries do.
+    document.getElementById('open-late').onclick = () => {
+      const el = overlay(`<div class="card">
+        <h3>WhatsApp offers</h3>
+        <p>Can we message you offers? We need your consent.</p>
+        <button>Allow</button><button>Decline</button>
+      </div>`);
+      document.body.appendChild(el);
+      setTimeout(() => {
+        button(el, 'Decline', () => { el.remove(); result('late', 'declined'); });
+      }, 100);
+    };
+
+    // A consent tool's hosted notice in a cross-origin iframe
+    // (consent.test is mapped to this server by the test runner). The page
+    // moves on only when the frame reports the person's answer.
+    document.getElementById('open-frame').onclick = () => {
+      const el = overlay(`<iframe src="http://consent.test:${location.port}/consent-frame.html" style="width:640px;height:520px;border:0;background:#fff"></iframe>`);
+      document.body.appendChild(el);
+      addEventListener('message', function onAnswer(e) {
+        if (!e.data || !e.data.consentFrame) return;
+        removeEventListener('message', onAnswer);
+        el.remove();
+        result('frame', e.data.consentFrame);
+      });
+    };
+
+    // A full-screen, position:fixed app layout that mentions consent and has
+    // a "Not now" somewhere among its many links. Not a prompt.
+    document.getElementById('open-shell').onclick = () => {
+      const links = Array.from({ length: 35 }, (_, i) => `<a href="#">Section ${i + 1}</a>`).join(' ');
+      const el = overlay(`<nav>${links}</nav>
+        <p>Read our privacy notice. We may ask for your consent before sending updates.</p>
+        <button>Not now</button>`, { cls: 'shell' });
+      el.querySelector('button').addEventListener('click', () => result('shell', 'clicked'));
+      document.body.appendChild(el);
+    };
+
+    // Modelled on lawcumen.in: a Bar Council disclaimer before entering a
+    // law firm's site. "Agree" is a plain <span> wired up in script, with no
+    // pointer cursor or role; "Disagree" is a link to another page.
+    const BAR_COUNCIL = 'The Bar Council of India does not permit advertisement or solicitation by advocates. By accessing this website you acknowledge that you are seeking information of your own accord.';
+    document.getElementById('open-entry').onclick = () => {
+      const el = overlay(`<div class="card">
+        <p>${BAR_COUNCIL}</p>
+        <p><span class="agree">Agree</span> <a href="prompts.html?left=disagree">Disagree</a></p>
+      </div>`);
+      setTimeout(() => el.querySelector('.agree').addEventListener('click', () => { el.remove(); result('entry', 'agreed'); }));
+      document.body.appendChild(el);
+    };
+    document.getElementById('open-exit-only').onclick = () => {
+      document.body.appendChild(overlay(`<div class="card">
+        <p>${BAR_COUNCIL}</p>
+        <p><a href="prompts.html?left=disagree">Disagree</a></p>
+      </div>`));
+    };
+
+    document.getElementById('open-form').onclick = () => {
+      const el = overlay(`<div class="card">
+        <h3>Get offers by email</h3>
+        <p>We need your consent to email you offers.</p>
+        <input type="email" placeholder="you@example.com">
+        <button>I agree</button><button>No thanks</button>
+      </div>`);
+      el.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => result('form', 'clicked:' + b.textContent)));
+      document.body.appendChild(el);
+    };
+
+    document.getElementById('open-destructive').onclick = () => {
+      const el = overlay(`<div class="card" role="alertdialog">
+        <h3>Delete account?</h3>
+        <p>This permanently erases your personal data.</p>
+        <button>Cancel</button><button>Delete</button>
+      </div>`);
+      el.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => result('destructive', 'clicked:' + b.textContent)));
+      document.body.appendChild(el);
+    };
+
+    document.getElementById('open-cookie').onclick = () => {
+      const el = overlay(`We use cookies to improve your experience and agree you accept our privacy notice. <button>Accept</button>`, { cls: 'bar' });
+      el.querySelector('button').addEventListener('click', () => result('cookie', 'clicked'));
+      document.body.appendChild(el);
+    };
+  </script>
+</body>
+</html>

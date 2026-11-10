@@ -2,36 +2,20 @@
 
 const $ = (id) => document.getElementById(id);
 
-const VERDICTS = {
-  A: { cls: 'ok', text: '✅ Safe to use, this policy respects your privacy.' },
-  B: { cls: 'ok', text: '✅ Reasonably safe, with minor concerns.' },
-  C: { cls: 'warn', text: '⚠️ Use with caution, some concerning practices.' },
-  D: { cls: 'danger', text: '🚫 Risky, consider an alternative if you can.' },
-  F: { cls: 'danger', text: '🚫 Avoid sharing personal data with this site.' },
-};
-
 async function init() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
-  // Settings toggles
-  const { settings = {} } = await chrome.storage.local.get('settings');
-  const toastToggle = $('toastToggle');
-  toastToggle.checked = settings.toastEnabled !== false;
-  toastToggle.addEventListener('change', () => {
-    settings.toastEnabled = toastToggle.checked;
-    chrome.storage.local.set({ settings });
-  });
-  const aiToggle = $('aiToggle');
-  aiToggle.checked = settings.aiEnabled !== false;
-  aiToggle.addEventListener('change', () => {
-    settings.aiEnabled = aiToggle.checked;
-    chrome.storage.local.set({ settings });
-  });
+  const { settings = {}, stats } = await chrome.storage.local.get(['settings', 'stats']);
+  bindSetting(settings, 'promptsToggle', 'promptsEnabled');
+  bindSetting(settings, 'toastToggle', 'toastEnabled');
+  bindSetting(settings, 'aiToggle', 'aiEnabled');
 
-  // Total banners blocked (global stat)
-  const { stats } = await chrome.storage.local.get('stats');
   const total = (stats && stats.totalBanners) || 0;
-  $('totalBanners').textContent = `${total} banner${total === 1 ? '' : 's'} blocked so far`;
+  $('totalHandled').textContent = `${total} popup${total === 1 ? '' : 's'} handled`;
+  $('historyBtn').addEventListener('click', () => {
+    chrome.tabs.create({ url: chrome.runtime.getURL('popup/history.html') });
+    window.close();
+  });
 
   if (!tab || !tab.url || !/^https?:/.test(tab.url)) {
     showUnavailable('Open a website to see its privacy report.');
@@ -40,24 +24,7 @@ async function init() {
 
   const url = new URL(tab.url);
   $('siteName').textContent = url.hostname;
-
-  // Per-site escape hatch: pause tracker blocking if a site misbehaves.
-  const siteAllowToggle = $('siteAllowToggle');
-  try {
-    siteAllowToggle.checked = await chrome.runtime.sendMessage({
-      action: 'getSiteAllow',
-      host: url.hostname,
-    });
-  } catch { /* background unavailable */ }
-  siteAllowToggle.addEventListener('change', async () => {
-    await chrome.runtime.sendMessage({
-      action: 'setSiteAllow',
-      host: url.hostname,
-      allow: siteAllowToggle.checked,
-    });
-    chrome.tabs.reload(tab.id); // rules apply on next load
-    window.close();
-  });
+  bindSiteAllow(tab, url.hostname);
 
   // Ask the content script for the live page report
   let report = null;
@@ -66,121 +33,192 @@ async function init() {
   } catch {
     // Content script not injected (page loaded before install, or blocked)
   }
-
   if (!report) {
     showUnavailable('Reload this page to activate the shield.');
     return;
   }
 
-  renderBanner(report.bannerBlocked, report.bannerPresent);
+  renderActivity(report.actions || []);
+  bindReport(url.hostname, report.actions || []);
   renderBlockedTrackers(tab.id);
   renderDetectedTrackers(report.trackers || []);
   renderCookieCount(tab.url);
   renderAlternatives(url.hostname);
 
-  // The grade reflects the privacy policy only; trackers are shown separately.
-  const score = await chrome.runtime.sendMessage({
-    action: 'getScore',
-    origin: report.origin,
-    policyUrl: report.policyUrl,
-    policyUrls: report.policyUrls,
-  });
-  renderScore(score);
+  // Text is fetched by the content script (page context: real cookies,
+  // real referer), not the background worker, so WAF-protected sites see
+  // an ordinary in-page request instead of a bot-like service-worker
+  // fetch. If a fresh pageReady cycle already cached a result,
+  // background.js's cache check short-circuits before this text is even
+  // needed.
+  async function fetchAndCheck(forceRefresh) {
+    let fetched = { url: report.policyUrl, text: '' };
+    try {
+      fetched = await chrome.tabs.sendMessage(tab.id, {
+        action: 'fetchPolicyText',
+        policyUrls: report.policyUrls,
+      }) || fetched;
+    } catch { /* content script unavailable; cache lookup may still hit */ }
+    return chrome.runtime.sendMessage({
+      action: 'checkNotice',
+      origin: report.origin,
+      policyUrl: fetched.url || report.policyUrl,
+      policyText: fetched.text,
+      forceRefresh,
+    });
+  }
+
+  renderNotice(await fetchAndCheck(false));
 
   $('refreshBtn').addEventListener('click', async () => {
-    $('gradeTitle').textContent = 'Re-analyzing…';
-    const fresh = await chrome.runtime.sendMessage({
-      action: 'getScore',
-      origin: report.origin,
-      policyUrl: report.policyUrl,
-      policyUrls: report.policyUrls,
-      forceRefresh: true,
-    });
-    renderScore(fresh);
+    $('noticeStatus').hidden = false;
+    $('noticeStatus').textContent = 'Re-checking…';
+    renderNotice(await fetchAndCheck(true));
   });
 }
 
-function renderScore(result) {
-  const circle = $('gradeCircle');
-  const findings = $('findings');
-  const verdict = $('verdict');
-  findings.innerHTML = '';
+// A checkbox bound to one boolean in settings. Every setting defaults to on.
+function bindSetting(settings, inputId, key) {
+  const input = $(inputId);
+  input.checked = settings[key] !== false;
+  input.addEventListener('change', () => {
+    settings[key] = input.checked;
+    chrome.storage.local.set({ settings });
+  });
+}
 
-  if (!result || result.grade === '?') {
-    circle.textContent = '?';
-    circle.className = 'grade-circle grade-unknown';
-    $('gradeTitle').textContent = 'No policy analyzed';
-    $('gradeSub').textContent = (result && result.bad && result.bad[0]) || 'Could not find a privacy policy on this page.';
-    verdict.hidden = true;
+// Per-site escape hatch: pause tracker blocking if a site misbehaves.
+async function bindSiteAllow(tab, host) {
+  const toggle = $('siteAllowToggle');
+  try {
+    toggle.checked = await chrome.runtime.sendMessage({ action: 'getSiteAllow', host });
+  } catch { /* background unavailable */ }
+  toggle.addEventListener('change', async () => {
+    await chrome.runtime.sendMessage({ action: 'setSiteAllow', host, allow: toggle.checked });
+    chrome.tabs.reload(tab.id); // rules apply on next load
+    window.close();
+  });
+}
+
+function renderActivity(actions) {
+  const list = $('activityList');
+  list.replaceChildren(...actions.slice().reverse().map((entry) => renderActivityItem(entry)));
+  $('activityEmpty').hidden = actions.length > 0;
+  $('activityCount').textContent = actions.length > 0 ? actions.length : '';
+}
+
+// The six things the DPDP Rules say a privacy notice must tell you, found or
+// not found in this site's policy: read by AI, or by text match when AI was
+// not available (background.js, getNoticeChecks). Found rows carry the
+// policy's own words on hover, so a tick can be checked by eye.
+const NOTICE_SOURCE_TEXT = {
+  ai: { label: 'AI', title: 'Read by AI. Every tick quotes the policy; hover a line to see it.' },
+  text: {
+    label: 'AI not available',
+    title: 'AI could not read this policy just now (it may be turned off in settings, or busy), so Nazar checked its wording instead. That can miss unusual phrasing; Re-check tries AI again.',
+  },
+};
+const NOTICE_STATUS_TEXT = {
+  'no-policy': 'No privacy policy link on this page.',
+  unreadable: 'Could not read a privacy policy here: the link may lead to another page, or the policy may load in a way Nazar cannot read.',
+};
+
+function renderNotice(result) {
+  const status = $('noticeStatus');
+  const list = $('noticeList');
+  const tally = $('noticeTally');
+  const policyLink = $('policyLink');
+
+  policyLink.hidden = !(result && result.policyUrl);
+  if (result && result.policyUrl) policyLink.href = result.policyUrl;
+
+  if (!result || result.status !== 'checked') {
+    status.hidden = false;
+    status.textContent = (result && NOTICE_STATUS_TEXT[result.status]) || 'Could not check the privacy policy.';
+    list.replaceChildren();
+    tally.textContent = '';
+    $('noticeMeta').hidden = true;
     return;
   }
 
-  circle.textContent = result.grade;
-  circle.className = 'grade-circle grade-' + result.grade;
-  $('gradeTitle').textContent = `Privacy score: ${result.score}/100`;
-  if (result.source === 'ai') {
-    const chip = document.createElement('span');
-    chip.className = 'ai-chip';
-    chip.title = 'Analyzed by AI (Claude), which reads the policy for meaning';
-    chip.textContent = 'AI';
-    $('gradeTitle').appendChild(chip);
-  }
-
-  const sub = $('gradeSub');
-  sub.innerHTML = '';
-  if (result.policyUrl) {
-    const a = document.createElement('a');
-    a.href = result.policyUrl;
-    a.target = '_blank';
-    a.textContent = 'View the policy →';
-    sub.appendChild(a);
-  }
-
-  const v = VERDICTS[result.grade];
-  verdict.hidden = false;
-  verdict.className = 'verdict ' + v.cls;
-  // The AI writes a site-specific one-liner; fall back to the canned verdict.
-  // Length guard rejects paragraph-style summaries from stale caches.
-  const summary = result.summary && result.summary.length <= 110 ? result.summary : '';
-  verdict.textContent = summary || v.text;
-
-  for (const label of result.good || []) addFinding(findings, label, true);
-  for (const label of result.bad || []) addFinding(findings, label, false);
+  status.hidden = true;
+  tally.textContent = `${result.found} of ${result.total}`;
+  tally.className = 'notice-tally ' + (result.found === result.total ? 'good' : 'bad');
+  const source = NOTICE_SOURCE_TEXT[result.source] || NOTICE_SOURCE_TEXT.text;
+  const sourceEl = $('noticeSource');
+  sourceEl.textContent = source.label;
+  sourceEl.title = source.title;
+  sourceEl.className = 'notice-source ' + (result.source === 'ai' ? 'ai' : 'text');
+  $('noticeMeta').hidden = false;
+  const byKey = new Map(result.checks.map((check) => [check.key, check]));
+  list.replaceChildren(...NazarNotice.CHECKS.map((check) => {
+    const outcome = byKey.get(check.key) || { found: false, quote: '', note: '' };
+    const li = document.createElement('li');
+    li.className = 'notice-item ' + (outcome.found ? 'found' : 'missing');
+    const said = outcome.found ? `"${outcome.quote}"` : 'Not found in the policy.';
+    li.title = [`${check.rule}: ${said}`, outcome.note].filter(Boolean).join('\n');
+    const icon = document.createElement('span');
+    icon.className = 'notice-icon';
+    icon.textContent = outcome.found ? '✓' : '✕';
+    const label = document.createElement('span');
+    label.textContent = check.label;
+    li.append(icon, label);
+    return li;
+  }));
 }
 
-function addFinding(container, label, isGood) {
-  const div = document.createElement('div');
-  div.className = 'finding ' + (isGood ? 'good' : 'bad');
-  const icon = document.createElement('span');
-  icon.className = 'icon';
-  icon.textContent = isGood ? '✓' : '✗';
-  const text = document.createElement('span');
-  text.textContent = label;
-  div.append(icon, text);
-  container.appendChild(div);
+// "Report this site": tells Privacy Labs a popup here was handled wrong.
+// Sends only on the person's click, and only the host name, what Nazar did
+// on this page and their note (background.js, sendReport).
+function bindReport(host, actions) {
+  const form = $('reportForm');
+  const open = $('reportOpen');
+  const result = $('reportResult');
+
+  open.addEventListener('click', () => {
+    open.hidden = true;
+    result.hidden = true;
+    form.hidden = false;
+  });
+  $('reportCancel').addEventListener('click', () => {
+    form.hidden = true;
+    open.hidden = false;
+  });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const send = $('reportSend');
+    send.disabled = true;
+    send.textContent = 'Sending…';
+    let sent = false;
+    try {
+      sent = await chrome.runtime.sendMessage({
+        action: 'reportSite',
+        host,
+        problem: form.elements.problem.value,
+        note: $('reportNote').value.trim(),
+        actions,
+      });
+    } catch { /* background unavailable */ }
+    send.disabled = false;
+    send.textContent = 'Send report';
+    if (!sent) {
+      result.textContent = 'Could not send the report. Please try again in a moment.';
+      result.className = 'report-result bad';
+      result.hidden = false;
+      return;
+    }
+    form.hidden = true;
+    form.reset();
+    result.textContent = 'Thanks, report sent. We look at every reported site.';
+    result.className = 'report-result good';
+    result.hidden = false;
+  });
 }
 
-function renderBanner(blocked, present) {
-  const el = $('bannerStatus');
-  if (blocked) {
-    el.textContent = 'Auto-rejected 🎉';
-    el.className = 'row-value good';
-  } else if (present) {
-    // Detected but no reject option to click (e.g. accept-only banners)
-    el.textContent = 'Detected, no reject option';
-    el.className = 'row-value bad';
-  } else {
-    el.textContent = 'None detected';
-    el.className = 'row-value';
-  }
-}
-
-// Trackers are now actively BLOCKED by declarativeNetRequest rules; this
-// reads the engine's match log for the tab and names each blocked company.
+// Trackers are BLOCKED by declarativeNetRequest rules; this reads the
+// engine's match log for the tab and names each blocked company.
 async function renderBlockedTrackers(tabId) {
   const count = $('trackerCount');
-  const list = $('trackerList');
-  list.innerHTML = '';
   let blockedRequests = 0;
   const companies = new Set();
   try {
@@ -193,38 +231,30 @@ async function renderBlockedTrackers(tabId) {
     }
   } catch { /* feedback API unavailable */ }
   count.textContent = blockedRequests;
-  count.className = 'row-value ' + (blockedRequests > 0 ? 'good' : '');
-  for (const name of companies) {
-    const chip = document.createElement('span');
-    chip.className = 'tracker-chip blocked';
-    chip.textContent = name + ' ✕';
-    list.appendChild(chip);
-  }
+  count.className = 'fact-value ' + (blockedRequests > 0 ? 'good' : '');
+  renderChips($('trackerList'), [...companies], 'blocked', (name) => name + ' ✕');
 }
 
 // Scripts detected on the page that we do NOT block (tag managers like GTM,
-// and anything the blocklist doesn't cover). Shown for transparency — we never
-// hide what a page loaded — but never scored against the site. The grade
-// reflects the privacy policy only.
+// and anything the blocklist doesn't cover). Shown for transparency, never
+// held against the site: the checklist reads the privacy policy only.
 function renderDetectedTrackers(detected) {
   const blockedNames = new Set(Object.values(TRACKER_RULE_NAMES));
   const unblocked = detected.filter((name) => !blockedNames.has(name));
-  const row = $('detectedRow');
-  const list = $('detectedList');
-  list.innerHTML = '';
-  if (unblocked.length === 0) {
-    row.hidden = true;
-    return;
-  }
-  row.hidden = false;
+  $('detectedRow').hidden = unblocked.length === 0;
   $('detectedCount').textContent = unblocked.length;
-  for (const name of unblocked) {
+  renderChips($('detectedList'), unblocked, 'neutral', (name) => name,
+    'Detected but not blocked. Tag managers load site functionality too, so blocking them breaks pages; the trackers they load are blocked individually.');
+}
+
+function renderChips(container, names, cls, label, title) {
+  container.replaceChildren(...names.map((name) => {
     const chip = document.createElement('span');
-    chip.className = 'tracker-chip neutral';
-    chip.title = 'Detected but not blocked. Tag managers load site functionality too, so blocking them breaks pages; the trackers they load are blocked individually.';
-    chip.textContent = name;
-    list.appendChild(chip);
-  }
+    chip.className = 'chip ' + cls;
+    chip.textContent = label(name);
+    if (title) chip.title = title;
+    return chip;
+  }));
 }
 
 async function renderCookieCount(tabUrl) {
@@ -234,7 +264,7 @@ async function renderCookieCount(tabUrl) {
     try {
       const cookies = await chrome.cookies.getAll({ url: tabUrl });
       el.textContent = cookies.length;
-      el.className = 'row-value ' + (cookies.length > 15 ? 'bad' : '');
+      el.className = cookies.length > 15 ? 'bad' : '';
       btn.hidden = cookies.length === 0;
     } catch {
       el.textContent = '-';
@@ -248,9 +278,9 @@ async function renderCookieCount(tabUrl) {
     await clearCookiesForUrl(tabUrl);
     await refresh();
     btn.disabled = false;
-    btn.textContent = 'Clear cookies';
-    el.textContent = '0 (cleared ✓)';
-    el.className = 'row-value good';
+    btn.textContent = 'Clear';
+    el.textContent = '0, cleared ✓';
+    el.className = 'good';
   });
 }
 
@@ -259,28 +289,21 @@ async function renderCookieCount(tabUrl) {
 async function clearCookiesForUrl(tabUrl) {
   try {
     const cookies = await chrome.cookies.getAll({ url: tabUrl });
-    const origin = new URL(tabUrl).origin;
     await Promise.all(
       cookies.map((c) => {
         // Reconstruct the cookie's URL (a cookie's domain may differ from the page)
         const scheme = c.secure ? 'https://' : 'http://';
         const host = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
-        const url = scheme + host + c.path;
-        return chrome.cookies.remove({ url, name: c.name }).catch(() => {});
+        return chrome.cookies.remove({ url: scheme + host + c.path, name: c.name }).catch(() => {});
       })
     );
-    // Best effort: also clear via origin URL for any host-only cookies missed
-    void origin;
   } catch { /* ignore */ }
 }
 
 function renderAlternatives(hostname) {
   const alts = findAlternatives(hostname);
   if (!alts) return;
-  const section = $('alternatives');
-  const list = $('altList');
-  list.innerHTML = '';
-  for (const alt of alts) {
+  $('altList').replaceChildren(...alts.map((alt) => {
     const a = document.createElement('a');
     a.className = 'alt-item';
     a.href = alt.url;
@@ -292,20 +315,17 @@ function renderAlternatives(hostname) {
     note.className = 'alt-note';
     note.textContent = alt.note;
     a.append(name, note);
-    list.appendChild(a);
-  }
-  section.hidden = false;
+    return a;
+  }));
+  $('alternatives').hidden = false;
 }
 
 function showUnavailable(message) {
-  $('gradeSection').hidden = true;
-  $('bannerRow').hidden = true;
-  document.querySelector('.trackers-row').hidden = true;
-  $('refreshBtn').hidden = true;
-  const notice = document.createElement('div');
-  notice.className = 'notice';
+  $('pageReport').hidden = true;
+  $('siteAllowRow').hidden = true;
+  const notice = $('unavailable');
   notice.textContent = message;
-  $('findings').replaceWith(notice);
+  notice.hidden = false;
 }
 
 init();

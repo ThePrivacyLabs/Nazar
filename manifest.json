@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Nazar - Privacy, Cookie & Tracker Blocker",
-  "version": "0.3.0",
-  "description": "Blocks trackers, auto-rejects cookie popups, sends privacy signals, and grades privacy policies, built for India's DPDP Act.",
+  "version": "0.4.0",
+  "description": "Answers consent popups for you, rejects cookie banners, blocks trackers, and grades privacy policies. Built for India's DPDP Act.",
   "permissions": ["storage", "activeTab", "cookies", "declarativeNetRequest", "declarativeNetRequestFeedback"],
   "host_permissions": ["<all_urls>"],
   "declarative_net_request": {
@@ -28,10 +28,18 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content/cookie-shield.js"],
+      "js": [
+        "content/lib/dom.js",
+        "content/lib/vocab.js",
+        "content/lib/ext.js",
+        "content/lib/activity.js",
+        "content/lib/toast.js",
+        "content/cookie-shield.js",
+        "content/consent-prompts.js"
+      ],
       "css": ["content/cookie-shield.css"],
       "run_at": "document_start",
-      "all_frames": false
+      "all_frames": true
     },
     {
       "matches": ["<all_urls>"],

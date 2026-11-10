@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Nazar - What Nazar did</title>
+  <link rel="stylesheet" href="popup.css">
+  <link rel="stylesheet" href="history.css">
+</head>
+<body class="history">
+  <div class="container">
+    <header>
+      <div class="logo"><span>🧿 <b>Nazar</b><sup class="beta-tag">beta</sup></span><span class="byline">by <img class="pl-wordmark" src="../assets/brand/logo-side.svg" alt="Privacy Labs"></span></div>
+      <button class="text-btn danger" id="clearBtn" hidden>Clear history</button>
+    </header>
+
+    <h1>What Nazar did</h1>
+    <p class="lede"><span id="summary">Every popup Nazar answered for you.</span>
+      This is your own copy, stored on this device only. The site keeps the legal record of your consent; to change a choice, use its privacy or consent settings.</p>
+
+    <div id="days"></div>
+    <div class="notice" id="empty" hidden>Nothing yet. Nazar will list popups here as it handles them.</div>
+  </div>
+  <script src="activity-view.js"></script>
+  <script src="history.js"></script>
+</body>
+</html>
