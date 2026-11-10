@@ -20,6 +20,21 @@ easy, with a focus on Indian users and India's DPDP Act.
 > backend (see [The optional AI backend](#the-optional-ai-backend)). Without it,
 > Nazar checks policies by matching their wording.
 
+## See it in action
+
+[![Nazar answering a sign-up consent popup and showing what it gave and refused](docs/media/nazar-demo.gif)](docs/media/nazar-demo.mp4)
+
+Under India's DPDP Act, every app and website must ask for your consent, one
+purpose at a time, and most of those questions are optional. Nazar answers them
+for you: no to what is optional, yes to what you need. The clip shows it on a
+made-up shop: the optional purposes at sign-up are switched off, the required
+one is kept, and the popup records what was given and what was refused.
+**[Watch the full 43-second explainer](docs/media/nazar-demo.mp4)** (with sound).
+
+<sub>Music in the explainer: "Ramp It Up" by Ahjay Stelino, from
+[Mixkit](https://mixkit.co), under the Mixkit Stock Music Free License. It is not
+covered by this repository's GPL-3.0 licence.</sub>
+
 ---
 
 ## What it does
